@@ -1,0 +1,92 @@
+######数据质控
+$ fastp -i raw_1.fq.gz -o clean_1.fq.gz -I raw_2.fq.gz -O clean_2.fq.gz 2> fatsp.log
+
+######变异位点挖掘
+# 建立参考基因组索引
+$ bwa index ref/hap1.genome.fasta
+$ samtools faidx ref/hap1.genome.fasta
+
+# 读段回贴参考基因组
+$ mkdir bam && cd bam
+$ bwa mem -t 4 -R "@RG\tID:${i}\tPL:illumina\tSM:${i}" ../ref/hap1.genome.fasta ${i}.clean_1.fq.gz  ${i}.clean_2.fq.gz | samtools view -Sb - > ${i}.bam
+# 统计比对情况
+$ mkdir flagstat 
+$ samtools flagstat ${i}.bam > flagstat/${i}.flagstat.txt
+# 对bam文件按照染色体位置进行排序
+$ mkdir sort
+$ samtools sort -@ 4 -m 4G -O bam -o sort/${i}.sort.bam ${i}.bam
+# 对bam文件标记PCR重复序列
+$ mkdir MarkDuplicates 
+$ gatk MarkDuplicates -I sort/${i}.sort.bam -O MarkDuplicates/${i}.rmdup.bam -M MarkDuplicates/${i}.sorted.markdup_metrics.txt
+# 创建比对索引文件
+$ samtools index MarkDuplicates/${i}.rmdup.bam
+# 使用GATK提取SNP，首先创建字典
+$ gatk CreateSequenceDictionary -R ref/hap1.genome.fasta -O ref/hap1.genome.dict
+# 生成中间文件gvcf
+$ gatk HaplotypeCaller -R ref/hap1.genome.fasta \
+    --emit-ref-confidence GVCF \
+    -I MarkDuplicates/${i}.rmdup.bam \
+    -stand-call-conf 30 --sample-ploidy 2 \
+    -O ${i}.g.vcf 
+# 合并所有样品的gvcf文件
+$ gatk CombineGVCFs -R ref/hap1.genome.fasta --variant gvcf.list -O combine.g.vcf.gz
+
+# 变异检测、生成vcf文件
+$ gatk GenotypeGVCFs -R ref/hap1.genome.fasta -V combine.g.vcf.gz -O combine.vcf.gz
+$ 过滤变异位点
+# gatk VariantFiltration -R ref/hap1.genome.fasta -V combine.vcf.gz --filter-expression "QD < 2.0 || MQ < 40.0 || FS > 60.0 || SOR > 3.0 || MQRankSum < -12.5 || ReadPosRankSum < -8.0" --filter-name "Filter" -O merge.vcf.gz
+
+
+
+
+
+
+######群体进化分析
+###1.系统进化树分析
+# vcf文件过滤
+$ plink --vcf  merge.vcf.gz --geno 0.1 --maf 0.01 --out all.missing_maf --recode vcf-iid --allow-extra-chr --set-missing-var-ids @:# --keep-allele-order
+$ plink --vcf all.missing_maf.vcf  --indep-pairwise 50 10 0.2 --out tmp.ld --allow-extra-chr --set-missing-var-ids @:#
+$ plink --vcf  all.missing_maf.vcf --make-bed --extract tmp.ld.prune.in --out all.LDfilter --recode vcf-iid --keep-allele-order --allow-extra-chr --set-missing-var-ids @:#
+# vcf文件格式转化
+$  python vcf2phylip.py -i all.LDfilter.vcf -f -o .
+# 系统进化树构建
+$ fasttree -nt -gtr all.LDfilter.min4.fasta >all.LDfilter.min4.nwk
+
+###2.PCA分析
+$ plink2 --vcf all.LDfilter.vcf --mind 0.10 --maf 0.05 --geno 0.05 --hwe 0.0001 --out all.LDfilter --recode vcf-iid --allow-extra-chr --set-missing-var-ids @:# --keep-allele-order
+$ plink2 --vcf all.LDfilter.vcf --indep-pairwise 50 10 0.2 --out tmp.ld --allow-extra-chr --set-missing-var-ids @:#
+$ plink2 --vcf all.LDfilter.vcf --extract tmp.ld.prune.in --out all.LDfilter --recode vcf-iid --keep-allele-order --allow-extra-chr --set-missing-var-ids @:#
+$ plink2 --vcf all.LDfilter.vcf --pca 8 --double-id -out all.LDfilter --allow-extra-chr
+
+###3.群体结构分析
+$ mkdir admixture && cd admixture
+$ cp /path/to/admixturePipeline/Docker/runDocker.sh .
+$ cp ../PCA/all.LDfilter.vcf .
+$ ./runDocker.sh
+$ admixturePipeline.py -m map.txt -v all.LDfilter.rename.vcf -k 1 -K 10 -n 16 -t 100 -a 0.05
+$ submitClumpak.py -p Liulian -M
+
+
+###4.IBS距离矩阵计算
+$ plink --allow-extra-chr --chr-set 28 --vcf all.LDfilter.vcf --distance-matrix 
+
+###5.Tajima's D
+$ vcftools --vcf all.LDfilter.vcf  --TajimaD 500000  --out all
+
+###6.π值
+$ vcftools --vcf all.LDfilter.vcf --window-pi 500000 --out pi_group1 --keep group1.txt
+$ vcftools --vcf all.LDfilter.vcf --window-pi 500000 --out pi_group2 --keep group2.txt
+$ vcftools --vcf all.LDfilter.vcf --window-pi 500000 --out pi_group3 --keep group3.txt
+
+###7.LD分析
+$ PopLDdecay -InVCF all.LDfilter.vcf -OutStat group1.stat.gz -SubPop group1.txt -MaxDist 1.5 
+$ PopLDdecay -InVCF all.LDfilter.vcf -OutStat group2.stat.gz -SubPop group2.txt -MaxDist 1.5
+$ PopLDdecay -InVCF all.LDfilter.vcf -OutStat group3.stat.gz -SubPop group3.txt -MaxDist 1.5
+$ PopLDdecay -InVCF all.LDfilter.vcf -OutStat all.stat.gz -MaxDist 1.5
+$ perl Plot_MultiPop.pl -inList multi.list -output MaxDist1.5 -bin1 10 -bin2 500 
+
+###8.计算Fst系数
+$ vcftools --vcf all.LDfilter.vcf --weir-fst-pop group1.txt --weir-fst-pop group2.txt --out group1_VS_group2 --fst-window-size 500000
+$ vcftools --vcf all.LDfilter.vcf --weir-fst-pop group1.txt --weir-fst-pop group3.txt --out group1_VS_group3 --fst-window-size 500000
+$ vcftools --vcf all.LDfilter.vcf --weir-fst-pop group2.txt --weir-fst-pop group3.txt --out group2_VS_group3 --fst-window-size 500000
+
